@@ -5,7 +5,7 @@
  * Semua operasi (Create, Read, Update, Delete) sekarang ditangani melalui
  * panggilan fetch ke endpoint http://localhost:3000/tasks.
  */
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, watchEffect } from 'vue' // [DIPERBAIKI] Impor watchEffect
 import { useDragAndDrop, DragAndDropEvent } from '@formkit/drag-and-drop/vue'
 
 // =================================================================
@@ -27,8 +27,6 @@ interface Task {
 // STATE MANAGEMENT & DRAG AND DROP SETUP
 // =================================================================
 
-// [DIPERBAIKI] useDragAndDrop mengembalikan sebuah array [parent, values].
-// Kita menggunakan array destructuring untuk mendapatkan ref yang benar.
 const [todoNode, todoTasks] = useDragAndDrop<Task>([], { group: 'kanban' })
 const [progressNode, progressTasks] = useDragAndDrop<Task>([], {
   group: 'kanban',
@@ -46,9 +44,10 @@ const errorMessage = ref<string | null>(null) // State untuk menampilkan pesan e
 
 /**
  * Mengambil semua tugas dari backend dan mengisi papan.
+ * Fungsi ini sekarang menjadi satu-satunya sumber kebenaran untuk data papan.
  */
 async function fetchTasks() {
-  isLoading.value = true
+  // Jangan set isLoading ke true jika hanya me-refresh, agar UI tidak berkedip saat drag.
   errorMessage.value = null
   try {
     const response = await fetch(API_URL)
@@ -76,7 +75,10 @@ async function fetchTasks() {
     errorMessage.value = error.message || 'Terjadi kesalahan saat menghubungi server.'
     console.error(error)
   } finally {
-    isLoading.value = false
+    // Hanya set isLoading ke false setelah pengambilan data awal selesai.
+    if (isLoading.value) {
+      isLoading.value = false
+    }
   }
 }
 
@@ -86,7 +88,6 @@ async function fetchTasks() {
 async function addTask() {
   if (!newTaskTitle.value.trim()) return
 
-  // Hanya kirim data yang dibutuhkan oleh backend (CreateTaskDto).
   const taskData = {
     title: newTaskTitle.value.trim(),
   }
@@ -98,16 +99,14 @@ async function addTask() {
       body: JSON.stringify(taskData),
     })
 
-    // Backend akan merespon dengan status 201 (Created) jika berhasil.
     if (!response.ok) {
-      // Coba baca pesan error dari body jika ada
       const errorData = await response.json().catch(() => null)
       const message = errorData?.message || 'Gagal menambahkan tugas baru.'
       throw new Error(Array.isArray(message) ? message.join(', ') : message)
     }
 
-    const newTask: Task = await response.json()
-    todoTasks.value.push(newTask) // Tambahkan ke UI setelah berhasil
+    // Setelah berhasil menambahkan, panggil fetchTasks untuk sinkronisasi
+    await fetchTasks()
     newTaskTitle.value = '' // Kosongkan input
   } catch (error: any) {
     errorMessage.value = error.message
@@ -124,7 +123,6 @@ async function deleteTask(taskToDelete: Task) {
       method: 'DELETE',
     })
 
-    // Backend akan merespon dengan 204 No Content, yang dianggap 'ok'.
     if (!response.ok) {
       throw new Error('Gagal menghapus tugas.')
     }
@@ -146,12 +144,26 @@ async function deleteTask(taskToDelete: Task) {
 
 /**
  * Mengupdate status tugas saat dipindahkan antar papan.
+ * Logika ini paling andal: gunakan info dari event untuk deteksi perpindahan.
  */
 async function handleTaskMove(event: DragAndDropEvent) {
+  // Ambil ID kolom asal dan tujuan langsung dari event. Ini cara yang paling benar.
+  const originalBoardId = (event.detail.originalParent.el as HTMLElement).id as TaskStatus
+  const newBoardId = (event.detail.targetParent.el as HTMLElement).id as TaskStatus
   const taskId = (event.detail.targetData.node.el as HTMLElement).dataset.id
-  const newBoardId = (event.detail.targetData.parent.el as HTMLElement).id as TaskStatus
 
-  if (!taskId || !newBoardId) return
+  // Jika kolom asal dan tujuan sama, berarti hanya re-order. Tidak perlu panggil API.
+  if (originalBoardId === newBoardId) {
+    console.log(
+      `Tugas ${taskId} diurutkan ulang di kolom '${newBoardId}'. Tidak ada panggilan API.`,
+    )
+    return
+  }
+
+  // Jika kita sampai di sini, tugas PASTI pindah kolom.
+  console.log(
+    `Tugas ${taskId} dipindahkan dari '${originalBoardId}' ke '${newBoardId}'. Memanggil API...`,
+  )
 
   try {
     const response = await fetch(`${API_URL}/${taskId}`, {
@@ -161,14 +173,20 @@ async function handleTaskMove(event: DragAndDropEvent) {
     })
 
     if (!response.ok) {
-      throw new Error('Gagal memindahkan tugas. Mengembalikan ke posisi semula.')
+      const errorData = await response.json().catch(() => ({ message: 'Gagal memindahkan tugas.' }))
+      throw new Error(
+        Array.isArray(errorData.message) ? errorData.message.join(', ') : errorData.message,
+      )
     }
-    // Jika berhasil, UI sudah diupdate oleh library, jadi tidak perlu melakukan apa-apa.
-    console.log(`Tugas ${taskId} berhasil dipindahkan ke ${newBoardId}`)
+
+    console.log(`Backend mengonfirmasi: Tugas ${taskId} berhasil diupdate.`)
   } catch (error: any) {
     errorMessage.value = error.message
-    console.error(error)
-    // Jika gagal, ambil ulang semua data untuk memastikan UI konsisten dengan server
+    console.error('Error saat memindahkan tugas:', error)
+  } finally {
+    // **SOLUSI UTAMA**: Selalu muat ulang semua data dari server setelah mencoba memindahkan.
+    // Ini memastikan UI selalu sinkron dengan database, baik saat berhasil maupun gagal.
+    console.log('Memuat ulang semua tugas untuk menyinkronkan UI.')
     await fetchTasks()
   }
 }
@@ -180,11 +198,20 @@ async function handleTaskMove(event: DragAndDropEvent) {
 onMounted(async () => {
   // Ambil data saat komponen dimuat
   await fetchTasks()
+})
 
-  // Pasang event listener untuk menangani perpindahan tugas
-  todoNode.value?.addEventListener('end', handleTaskMove)
-  progressNode.value?.addEventListener('end', handleTaskMove)
-  doneNode.value?.addEventListener('end', handleTaskMove)
+// [DIPERBAIKI] Gunakan watchEffect untuk memasang event listener.
+// Ini adalah cara yang paling andal untuk memastikan elemen DOM sudah ada.
+watchEffect(() => {
+  if (todoNode.value) {
+    todoNode.value.addEventListener('end', handleTaskMove)
+  }
+  if (progressNode.value) {
+    progressNode.value.addEventListener('end', handleTaskMove)
+  }
+  if (doneNode.value) {
+    doneNode.value.addEventListener('end', handleTaskMove)
+  }
 })
 </script>
 

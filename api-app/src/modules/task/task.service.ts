@@ -80,6 +80,8 @@ export class TaskService {
     // Pertama, cari tugasnya. Method findOne akan melempar error jika tidak ada.
     const task = await this.findOne(id);
 
+    console.log('Task: ', task);
+
     // Ubah statusnya.
     task.status = status;
 
